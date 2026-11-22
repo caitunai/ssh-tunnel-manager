@@ -1,6 +1,6 @@
 ![Tunnel Terminal Preview](assets/tunnel-terminal-demo-v2.svg)
 
-# ssh-tunnel-manager
+# SSH-Tunnel-Manager
 
 A lightweight, configuration-driven SSH tunnel manager for macOS and Linux. Manage multiple local and remote port forwards from a single terminal without extra runtime libraries or keeping terminal windows open.
 
