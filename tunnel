@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+# tunnel v1.3.0 — Bash 3.2+, macOS and Linux; standard Unix tools only.
+set -u
+umask 077
+CONFIG="$HOME/.ssh/tunnels.toml"
+SOCKET_DIR="$HOME/.ssh/tunnels"
+VERSION=1.3.0
+
+# Resolve commands through PATH (BSD, GNU and compatible implementations).
+check_dependencies() {
+    local cmd missing=0
+    for cmd in ssh awk cat mkdir chmod rm rmdir sleep wc; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            printf 'tunnel: missing dependency: %s\n' "$cmd" >&2
+            missing=1
+        fi
+    done
+    (( missing == 0 )) || return 1
+    SSH=$(command -v ssh) || return 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: tunnel [list|status|connect|disconnect|restart|help] [NAME ...|all]
+       tunnel start NAME ...|all     (alias for connect)
+       tunnel stop NAME ...|all      (alias for disconnect)
+       tunnel --version
+
+Configuration: ~/.ssh/tunnels.toml
+No arguments: status of all configured tunnels.
+Mutating commands require names or the explicit word all.
+Colors: TUNNEL_COLOR=auto (default), always, or never; NO_COLOR disables auto colors.
+Display: Bare ports in LOCAL and REMOTE mean IPv4 loopback (127.0.0.1).
+         -> is local (-L); <- is remote (-R).
+         ST: UP, DOWN, STALE, ? (unknown).
+         NAME shows name(host) only if name does not contain the SSH host.
+EOF
+}
+
+# Restricted TOML: parent tables and arrays of forward tables.
+# No eval or source. Emit one validated row per forwarding rule.
+parse_config() {
+    LC_ALL=C awk '
+    function die(msg) { printf "tunnel: %s:%d: %s\n", FILENAME, NR, msg > "/dev/stderr"; bad=1; exit 2 }
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function endpoint(s, p, h) {
+        if (s !~ /:[0-9]+$/) return 0
+        p=s; sub(/^.*:/, "", p)
+        if (length(p)>5 || p+0<1 || p+0>65535 || p ~ /^0/) return 0
+        h=s; sub(/:[0-9]+$/, "", h)
+        return (h ~ /^[A-Za-z0-9_.-]+$/ && h !~ /^-/) || (h ~ /^\[[0-9A-Fa-f:.]+(%[A-Za-z0-9_.-]+)?\]$/ && h ~ /:/) || h=="*"
+    }
+    function valid_host() {
+        if (v["host"] !~ /^[A-Za-z0-9_.][A-Za-z0-9_.@-]*$/) die("invalid or missing SSH host in " name)
+        if (("type" in v) && v["type"]!="local" && v["type"]!="remote") die("invalid default type in " name)
+    }
+    function emit(t,l,r,    bind) {
+        if (t!="local" && t!="remote") die("type must be local or remote in " name)
+        if (!endpoint(l) || !endpoint(r)) die("invalid or missing endpoint in " name ": expected host:port or [IPv6]:port")
+        if ((t=="local" && r ~ /^\*:/) || (t=="remote" && l ~ /^\*:/)) die("wildcard is only allowed at the listening endpoint")
+        bind=t SUBSEP (t=="local" ? l : r)
+        if (bind in bindings) die("duplicate listening endpoint in " name)
+        bindings[bind]=1
+        printf "%s\t%s\t%s\t%s\t%s\n", name,v["host"],t,l,r
+    }
+    function flush_forward(    k,t) {
+        if (!in_forward) return
+        t=("type" in f) ? f["type"] : v["type"]
+        emit(t,f["local"],f["remote"])
+        for (k in f) delete f[k]
+    }
+    function flush(    k) {
+        if (name=="") return
+        valid_host()
+        if (in_forward) flush_forward()
+        else emit(v["type"],v["local"],v["remote"])
+        for (k in v) delete v[k]
+        for (k in bindings) delete bindings[k]
+        in_forward=0
+    }
+    {
+        sub(/\r$/, "")
+        s=trim($0)
+        if (s=="" || s ~ /^#/) next
+        if (s ~ /^\[tunnels\.[A-Za-z0-9_-]+\][ \t]*(#.*)?$/) {
+            flush()
+            sub(/^\[tunnels\./, "", s); sub(/\].*$/, "", s)
+            if (s=="all" || length(s)>40 || s in names) die("reserved, long or duplicate tunnel name: " s)
+            names[s]=1; name=s; next
+        }
+        if (s ~ /^\[\[tunnels\.[A-Za-z0-9_-]+\.forwards\]\][ \t]*(#.*)?$/) {
+            sub(/^\[\[tunnels\./, "", s); sub(/\.forwards\]\].*$/, "", s)
+            if (name=="" || s!=name) die("each forwards table must follow its own [tunnels.NAME] parent")
+            valid_host()
+            if (("local" in v) || ("remote" in v)) die("cannot mix legacy endpoints and forwards tables in " name)
+            flush_forward(); in_forward=1; next
+        }
+        if (name=="") die("expected [tunnels.NAME]")
+        if (s !~ /^(host|type|local|remote)[ \t]*=[ \t]*"[^"\\]*"[ \t]*(#.*)?$/) die("unsupported or malformed setting in " name)
+        key=s; sub(/[ \t]*=.*/, "", key)
+        sub(/^[^=]*=[ \t]*"/, "", s); sub(/".*/, "", s)
+        if (in_forward) {
+            if (key=="host") die("host belongs in the parent table")
+            if (key in f) die("duplicate forward key: " key)
+            f[key]=s
+        } else {
+            if (key in v) die("duplicate key: " key)
+            v[key]=s
+        }
+    }
+    END { if (!bad) { flush(); if (name=="") die("no tunnels configured") } }
+    ' "$CONFIG"
+}
+
+# Only decorate interactive output by default; preserve plain machine output.
+color_enabled=0
+case "${TUNNEL_COLOR:-auto}" in
+    always) color_enabled=1 ;;
+    never) ;;
+    auto) if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR:-}" ]]; then color_enabled=1; fi ;;
+    *) printf 'tunnel: invalid TUNNEL_COLOR (use auto, always, or never)\n' >&2; exit 2 ;;
+esac
+
+paint() {
+    local code="$1" value="$2"
+    if (( color_enabled )); then printf '\033[%sm%s\033[0m' "$code" "$value"
+    else printf '%s' "$value"; fi
+}
+
+# Control operations are local: never establish a new SSH session.
+check_master() {
+    LC_ALL=C "$SSH" -S "$sock" -o ControlMaster=no -O check "$host" 2>&1
+}
+
+# Serialize changes to individual tunnel names. A lock may remain after SIGKILL.
+with_lock() (
+    lock="$sock.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        printf '%s: busy (lock: %s)\n' "$name" "$lock" >&2
+        exit 1
+    fi
+    trap 'rmdir "$lock" 2>/dev/null || :' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    case "$action" in
+        connect) connect_one ;;
+        disconnect) disconnect_one ;;
+        restart) disconnect_one && connect_one ;;
+    esac
+)
+
+connect_one() {
+    local result
+    local -a ssh_forwards
+    local i
+    if result=$(check_master); then
+        printf '%s: already connected (%s)\n' "$name" "$result"
+        return 0
+    fi
+    if [[ -e "$sock" || -L "$sock" ]]; then
+        if [[ -S "$sock" && ! -L "$sock" && "$result" == *"Connection refused"* ]]; then
+            rm -f "$sock" || return 1
+        else
+            printf '%s: cannot safely reuse socket: %s\n' "$name" "$result" >&2
+            return 1
+        fi
+    fi
+    ssh_forwards=()
+    for ((i=0; i<${#types[@]}; i++)); do
+        if [[ "${types[i]}" == local ]]; then
+            ssh_forwards+=(-L "${locals[i]}:${remotes[i]}")
+        else
+            ssh_forwards+=(-R "${remotes[i]}:${locals[i]}")
+        fi
+    done
+    if "$SSH" -f -N -T -M -S "$sock" \
+        -o ControlPersist=no -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+        -o ConnectTimeout=10 -o PermitLocalCommand=no \
+        -o ForwardAgent=no -o ForwardX11=no \
+        "${ssh_forwards[@]}" "$host"; then
+        if result=$(check_master); then
+            printf '%s: %s (%s, %s forwards)\n' "$name" "$(paint 32 connected)" "$result" "${#types[@]}"
+            return 0
+        fi
+        printf '%s: SSH started but control socket check failed: %s\n' "$name" "$result" >&2
+    else
+        printf '%s: connection failed\n' "$name" >&2
+    fi
+    return 1
+}
+
+disconnect_one() {
+    local result i
+    if ! result=$(check_master); then
+        if [[ ! -e "$sock" && ! -L "$sock" ]]; then
+            printf '%s: already disconnected\n' "$name"
+            return 0
+        fi
+        if [[ -S "$sock" && ! -L "$sock" && "$result" == *"Connection refused"* ]]; then
+            rm -f "$sock" || return 1
+            printf '%s: disconnected (stale socket removed)\n' "$name"
+            return 0
+        fi
+        printf '%s: cannot verify tunnel state: %s\n' "$name" "$result" >&2
+        return 1
+    fi
+    if ! result=$(LC_ALL=C "$SSH" -S "$sock" -o ControlMaster=no -O exit "$host" 2>&1); then
+        printf '%s: disconnect failed: %s\n' "$name" "$result" >&2
+        return 1
+    fi
+    # Wait for the old control socket to disappear before a restart.
+    for ((i=0; i<50; i++)); do
+        if [[ ! -e "$sock" && ! -L "$sock" ]]; then
+            printf '%s: %s\n' "$name" "$(paint 31 disconnected)"
+            return 0
+        fi
+        sleep 0.1
+    done
+    printf '%s: exit requested, but socket still exists; retry status\n' "$name" >&2
+    return 1
+}
+
+# Abbreviate only exact IPv4 loopback; preserve all other addresses.
+endpoint_label() {
+    case "$1" in
+        127.0.0.1:*) printf '%s' "${1##*:}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Collect plain records first. Measure the exact displayed cells before coloring.
+status_one() {
+    local result state i direction local_label remote line display_name display_state
+    if result=$(check_master); then
+        state=UP
+    elif [[ ! -e "$sock" && ! -L "$sock" ]]; then
+        state=DOWN
+    elif [[ -S "$sock" && ! -L "$sock" && "$result" == *"Connection refused"* ]]; then
+        state=STALE
+    else
+        state='?'
+    fi
+    display_name="$name"; display_state="$state"
+    if [[ "$name" != *"$host"* ]]; then display_name="${name}(${host})"; fi
+    for ((i=0; i<${#types[@]}; i++)); do
+        if [[ "${types[i]}" == local ]]; then direction='->'; else direction='<-'; fi
+        local_label=$(endpoint_label "${locals[i]}")
+        remote=$(endpoint_label "${remotes[i]}")
+        printf -v line '%s\t%s\t%s\t%s\t%s\n' \
+            "$display_name" "$display_state" "$local_label" "$direction" "$remote"
+        status_rows+="$line"
+        display_name=""; display_state=""
+    done
+}
+
+# Each visible column has its own width, based on headers and selected rows.
+# All valid configuration values and display symbols are ASCII. ANSI codes
+# are added only after sizing; no leading/trailing whitespace in the last cell.
+print_status_table() {
+    [[ -n "$status_rows" ]] || return 0
+    printf '%s' "$status_rows" | LC_ALL=C awk -F '\t' -v color="$color_enabled" '
+        BEGIN {
+            n=split("NAME ST LOCAL DIR REMOTE", header, " ")
+            for (i=1; i<=n; i++) width[i]=length(header[i])
+        }
+        {
+            for (i=1; i<=n; i++) {
+                cell[NR,i]=$i
+                if (length($i)>width[i]) width[i]=length($i)
+            }
+        }
+        function tint(s, code) {
+            if (color && code!="" && s!="") return sprintf("\033[%sm%s\033[0m",code,s)
+            return s
+        }
+        function state_color(s) {
+            if (s=="UP") return "32"
+            if (s=="DOWN") return "31"
+            if (s=="STALE") return "33"
+            if (s=="?") return "35"
+            return ""
+        }
+        function print_row(r,   i,s,code) {
+            for (i=1; i<=n; i++) {
+                s=(r==0 ? header[i] : cell[r,i])
+                code=""
+                if (r==0) code="1"
+                else if (i==2) code=state_color(s)
+                else if (i==4) code=(s=="->" ? "36" : "34")
+                printf "%s",tint(s,code)
+                if (i<n) printf ("%" (width[i]-length(s)+2) "s"),""
+            }
+            printf "\n"
+        }
+        END {
+            print_row(0)
+            for (r=1; r<=NR; r++) print_row(r)
+        }
+    '
+}
+
+# Parse and validate all config and requested names before changing anything.
+action="${1:-status}"
+if (( $# )); then shift; fi
+case "$action" in
+    -h|--help|help) usage; exit 0 ;;
+    --version) printf 'tunnel %s\n' "$VERSION"; exit 0 ;;
+    start) action=connect ;;
+    stop) action=disconnect ;;
+    list|status|connect|disconnect|restart) ;;
+    *) usage >&2; exit 2 ;;
+esac
+if (( $# == 0 )); then
+    case "$action" in list|status) set -- all ;; *) usage >&2; exit 2 ;; esac
+fi
+check_dependencies || exit 1
+if [[ ! -r "$CONFIG" ]]; then
+    printf 'tunnel: cannot read %s\n' "$CONFIG" >&2; exit 2
+fi
+if ! rows=$(parse_config); then exit 2; fi
+names=()
+previous=""
+while IFS=$'\t' read -r name host type local_ep remote_ep; do
+    if [[ "$name" != "$previous" ]]; then names+=("$name"); previous="$name"; fi
+done <<< "$rows"
+if [[ "$1" == all && $# == 1 ]]; then
+    selected=("${names[@]}")
+else
+    selected=()
+    for requested in "$@"; do
+        found=0
+        for name in "${names[@]}"; do
+            if [[ "$requested" == "$name" ]]; then found=1; break; fi
+        done
+        if (( ! found )); then printf 'tunnel: unknown name: %s\n' "$requested" >&2; exit 2; fi
+        duplicate=0
+        # Bash 3.2 treats empty arrays differently under nounset.
+        for existing in ${selected[@]+"${selected[@]}"}; do
+            if [[ "$existing" == "$requested" ]]; then duplicate=1; break; fi
+        done
+        if (( ! duplicate )); then selected+=("$requested"); fi
+    done
+fi
+mkdir -p "$SOCKET_DIR" && chmod 700 "$SOCKET_DIR" || exit 1
+status_rows=""
+rc=0
+for name in "${names[@]}"; do
+    found=0
+    for requested in "${selected[@]}"; do
+        if [[ "$requested" == "$name" ]]; then found=1; break; fi
+    done
+    if (( ! found )); then continue; fi
+    types=(); locals=(); remotes=()
+    while IFS=$'\t' read -r row_name row_host row_type local_ep remote_ep; do
+        if [[ "$row_name" != "$name" ]]; then continue; fi
+        host="$row_host"
+        types+=("$row_type"); locals+=("$local_ep"); remotes+=("$remote_ep")
+    done <<< "$rows"
+    # ssh appends a temporary suffix when creating a master socket.
+    sock="$SOCKET_DIR/$name.sock"
+    if (( $(printf '%s' "$sock" | LC_ALL=C wc -c) > 85 )); then
+        printf '%s: control socket path too long: %s\n' "$name" "$sock" >&2
+        rc=1; continue
+    fi
+    case "$action" in
+        list|status) status_one ;;
+        *) with_lock || rc=1 ;;
+    esac
+done
+case "$action" in list|status) print_status_table || rc=1 ;; esac
+exit "$rc"

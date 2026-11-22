@@ -1,0 +1,39 @@
+# ~/.ssh/tunnels.toml — example configuration
+# local: SSH client endpoint; remote: SSH server endpoint.
+# Replace example SSH aliases and ports before connecting.
+
+[tunnels.gpu-server-proxy]
+host = "gpu-server"
+type = "remote"
+local = "127.0.0.1:7897"
+remote = "127.0.0.1:7897"
+
+[tunnels.db]
+host = "gateway"
+type = "local"
+local = "127.0.0.1:13306"
+remote = "127.0.0.1:3306"
+
+[tunnels.redis]
+host = "gateway"
+type = "local"
+local = "127.0.0.1:16379"
+remote = "10.0.0.20:6379"
+
+# One SSH connection, multiple forwards with mixed directions.
+[tunnels.gpu-server]
+host = "gpu-server"
+type = "local"
+
+[[tunnels.gpu-server.forwards]]
+local = "127.0.0.1:9010"
+remote = "127.0.0.1:9010"
+
+[[tunnels.gpu-server.forwards]]
+local = "127.0.0.1:9011"
+remote = "127.0.0.1:9011"
+
+[[tunnels.gpu-server.forwards]]
+type = "remote"
+local = "127.0.0.1:7898"
+remote = "127.0.0.1:7898"
